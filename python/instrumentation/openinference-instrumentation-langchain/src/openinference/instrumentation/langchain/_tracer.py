@@ -39,6 +39,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.tracers import BaseTracer, LangChainTracer
 from langchain_core.tracers.schemas import Run
+from langsmith.run_helpers import get_current_run_tree
 from opentelemetry import context as context_api
 from opentelemetry import trace as trace_api
 from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY, get_value
@@ -168,6 +169,19 @@ class OpenInferenceTracer(BaseTracer):
     def get_span(self, run_id: UUID) -> Optional[Span]:
         return self._spans_by_run.get(run_id)
 
+    def _get_parent_span(self, run: Run) -> Optional[Span]:
+        if not (parent_run_id := run.parent_run_id):
+            return None
+        if parent := self._spans_by_run.get(parent_run_id):
+            return parent
+        # The parent may be a non-callback run (e.g. a LangSmith `traceable` middleware hook)
+        # that this tracer never saw; its run tree lists the ancestors that it did see.
+        if (tree := get_current_run_tree()) and tree.id == parent_run_id:
+            for segment in reversed(tree.dotted_order.split(".")):
+                if parent := self._spans_by_run.get(UUID(segment[-36:])):
+                    return parent
+        return None
+
     @audit_timing  # type: ignore
     def _start_trace(self, run: Run) -> None:
         self.run_map[str(run.id)] = run
@@ -176,8 +190,7 @@ class OpenInferenceTracer(BaseTracer):
         with self._lock:
             parent_context = (
                 trace_api.set_span_in_context(parent)
-                if (parent_run_id := run.parent_run_id)
-                and (parent := self._spans_by_run.get(parent_run_id))
+                if (parent := self._get_parent_span(run))
                 else (context_api.Context() if self._separate_trace_from_runtime_context else None)
             )
         # We can't use real time because the handler may be
